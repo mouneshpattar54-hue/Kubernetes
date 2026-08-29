@@ -1,0 +1,198 @@
+================================================================================
+KUBERNETES PRODUCTION ENGINEERING & TROUBLESHOOTING PLAYBOOK
+================================================================================
+
+--------------------------------------------------------------------------------
+1. 1-MINUTE ELEVATOR PITCH (INTERVIEW ANSWER)
+--------------------------------------------------------------------------------
+"In a multi-node Kubernetes cluster, I resolved a critical CNI failure where 
+kubworker-node2 was scheduling pods into a persistent ContainerCreating state. 
+
+Inspecting kubectl describe pod and container logs showed FailedCreatePodSandbox: 
+failed to load flannel subnet.env because the kube-flannel DaemonSet was in 
+CrashLoopBackOff due to missing br_netfilter kernel configurations. 
+
+I loaded br_netfilter, enabled bridge-nf-call-iptables, bridge-nf-call-ip6tables, 
+and net.ipv4.ip_forward, and persisted them across reboots via /etc/modules-load.d/ 
+and /etc/sysctl.d/. 
+
+Once the pod was recycled, all 5 deployment replicas scheduled cleanly across 
+both worker nodes. I then validated deployment operations by scaling to 15 
+replicas, executing rolling updates via kubectl set image, and tracking 
+rollout state."
+
+
+--------------------------------------------------------------------------------
+2. INCIDENT CASE STUDY: CNI NETWORK FAILURE & NODE RECOVERY
+--------------------------------------------------------------------------------
+
+[A] Symptom & Initial State:
+----------------------------
+When deploying nginx-deploy (5 replicas), only 3 pods scheduled on kubworker-node1 
+reached Running status (3/5 Ready). Pods on kubworker-node2 remained stuck in 
+ContainerCreating with <none> as their IP.
+
+Cluster Pod Status:
+NAME                          READY   STATUS              RESTARTS   AGE     IP           NODE
+nginx-deploy-5dcc99ff6-5jgj4   1/1     Running             0          3m12s   10.244.1.6   kubworker-node1
+nginx-deploy-5dcc99ff6-7l98k   1/1     Running             0          3m12s   10.244.1.8   kubworker-node1
+nginx-deploy-5dcc99ff6-h9clr   0/1     ContainerCreating   0          3m12s   <none>       kubworker-node2
+nginx-deploy-5dcc99ff6-knqzb   1/1     Running             0          3m12s   10.244.1.7   kubworker-node1
+nginx-deploy-5dcc99ff6-v899g   0/1     ContainerCreating   0          3m12s   <none>       kubworker-node2
+
+
+[B] Root Cause Diagnostics:
+---------------------------
+Step 1 - Pod Event Inspection:
+Command:
+  kubectl describe pod nginx-deploy-5dcc99ff6-h9clr
+
+Error Output:
+  Warning  FailedCreatePodSandbox  6m26s  kubelet
+  Failed to create pod sandbox: rpc error: code = Unknown desc = failed to setup network for sandbox: 
+  plugin type="flannel" failed (add): failed to load flannel 'subnet.env' file: 
+  open /run/flannel/subnet.env: no such file or directory
+
+Step 2 - CNI DaemonSet Status:
+Command:
+  kubectl get pods -n kube-flannel -o wide
+
+Status Output:
+  kube-flannel-ds-5fg9g   1/1   Running            3 (35h ago)     172.31.13.232   kubmaster-node
+  kube-flannel-ds-7vhqk   0/1   CrashLoopBackOff   480 (41s ago)   172.31.12.72    kubworker-node2
+  kube-flannel-ds-cp5vs   1/1   Running            4 (40m ago)     172.31.4.17     kubworker-node1
+
+Step 3 - Flannel Crash Logs:
+Command:
+  kubectl logs -n kube-flannel kube-flannel-ds-7vhqk --previous
+
+Root Cause Log:
+  E0829 02:28:24.412497 1 main.go:292] Failed to check br_netfilter: 
+  stat /proc/sys/net/bridge/bridge-nf-call-iptables: no such file or directory
+
+
+[C] Permanent Remediation (Applied on kubworker-node2):
+-------------------------------------------------------
+1. Load the missing kernel module:
+   sudo modprobe br_netfilter
+
+2. Enable bridge filtering and IP forwarding in sysctl:
+   sudo sysctl -w net.bridge.bridge-nf-call-iptables=1
+   sudo sysctl -w net.bridge.bridge-nf-call-ip6tables=1
+   sudo sysctl -w net.ipv4.ip_forward=1
+
+3. Persist kernel module across reboots:
+   cat <<EOF | sudo tee /etc/modules-load.d/k8s.conf
+   overlay
+   br_netfilter
+   EOF
+
+4. Persist sysctl parameters across reboots:
+   cat <<EOF | sudo tee /etc/sysctl.d/k8s.conf
+   net.bridge.bridge-nf-call-iptables = 1
+   net.bridge.bridge-nf-call-ip6tables = 1
+   net.ipv4.ip_forward = 1
+   EOF
+
+5. Apply all system configurations:
+   sudo sysctl --system
+
+
+[D] Pod Recycling & Verification (From Master Node):
+----------------------------------------------------
+1. Restart the failing Flannel pod:
+   kubectl delete pod -n kube-flannel kube-flannel-ds-7vhqk
+
+2. Verify all pods receive IP addresses and transition to Running:
+   kubectl get pods -o wide
+
+Result:
+NAME                          READY   STATUS    RESTARTS   AGE   IP           NODE
+nginx-deploy-5dcc99ff6-5jgj4   1/1     Running   0          22m   10.244.1.6   kubworker-node1
+nginx-deploy-5dcc99ff6-7l98k   1/1     Running   0          22m   10.244.1.8   kubworker-node1
+nginx-deploy-5dcc99ff6-h9clr   1/1     Running   0          22m   10.244.2.3   kubworker-node2
+nginx-deploy-5dcc99ff6-knqzb   1/1     Running   0          22m   10.244.1.7   kubworker-node1
+nginx-deploy-5dcc99ff6-v899g   1/1     Running   0          22m   10.244.2.2   kubworker-node2
+
+
+--------------------------------------------------------------------------------
+3. SIDE INCIDENT: CONNECTION REFUSED ON PORT 6443
+--------------------------------------------------------------------------------
+Error Encountered on Worker Node:
+  The connection to the server 172.31.12.72:6443 was refused - did you specify the right host or port?
+
+Analysis:
+  kubectl commands were being executed directly from kubworker-node2, where 
+  kubeconfig was pointing to the local worker IP (172.31.12.72) instead of the 
+  control plane master IP (172.31.13.232).
+
+Verification Commands:
+  On Master:
+    sudo crictl ps | grep kube-apiserver
+    sudo ss -lntp | grep 6443
+
+  From Worker:
+    nc -zv 172.31.13.232 6443
+
+
+--------------------------------------------------------------------------------
+4. WORKLOAD MANAGEMENT & DEPLOYMENT LIFECYCLE
+--------------------------------------------------------------------------------
+
+Deployment Manifest (nginx-deploy.yaml):
+----------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: nginx-deploy
+  labels:
+    app: nginx-app
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: nginx-app
+  template:
+    metadata:
+      labels:
+        app: nginx-app
+    spec:
+      containers:
+        - name: nginx-container
+          image: nginx:stable-otel
+          ports:
+            - containerPort: 80
+
+Operational Commands:
+---------------------
+1. Apply Deployment:
+   kubectl apply -f nginx-deploy.yaml
+
+2. Scale Replicas:
+   kubectl scale deployment nginx-deploy --replicas=15
+   kubectl scale deployment nginx-deploy --replicas=1
+
+3. Rolling Updates & Tracking:
+   kubectl set image deployment/nginx-deploy nginx-container=nginx:stable-otel
+   kubectl rollout status deployment/nginx-deploy
+   kubectl rollout history deployment/nginx-deploy
+   kubectl rollout undo deployment/nginx-deploy
+
+
+--------------------------------------------------------------------------------
+5. MASTER TROUBLESHOOTING CHEAT SHEET
+--------------------------------------------------------------------------------
+Target Layer        Diagnostic Command                                    Expected Output
+----------------------------------------------------------------------------------------
+Node Health         kubectl get nodes -o wide                             Status: Ready
+Pod Health          kubectl get pods -o wide --all-namespaces             Status: Running
+Pod Events          kubectl describe pod <pod-name>                       Scheduled, Pulled, Started
+CNI Network Logs    kubectl logs -n kube-flannel <pod> --previous         Subnet allocated (vxlan)
+Kernel Module       lsmod | grep br_netfilter                             br_netfilter listed
+Kernel Routing      sysctl net.bridge.bridge-nf-call-iptables             Value = 1
+IP Forwarding       sysctl net.ipv4.ip_forward                            Value = 1
+API Server Port     ss -lntp | grep 6443                                  LISTEN on 0.0.0.0:6443
+Network Reachable   nc -zv <MASTER-IP> 6443                               Connection open
+Deployment Rollout  kubectl rollout status deployment/<name>              Successfully rolled out
+================================================================================
+```[cite: 5]
