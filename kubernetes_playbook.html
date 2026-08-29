@@ -1,0 +1,165 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @page {
+    size: A4;
+    margin: 14mm 12mm;
+    background-color: #ffffff;
+    @bottom-right {
+      content: "Page " counter(page) " of " counter(pages);
+      font-size: 8pt;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #64748b;
+    }
+    @bottom-left {
+      content: "Kubernetes Production Engineering & Troubleshooting Playbook";
+      font-size: 8pt;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      color: #64748b;
+    }
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    color: #1e293b; font-size: 9.2pt; line-height: 1.45;
+  }
+  .header {
+    background: linear-gradient(135deg, #0f172a 0%, #1e3a8a 100%);
+    color: #ffffff; padding: 16px 20px; border-radius: 8px; margin-bottom: 14px;
+  }
+  .header h1 { margin: 0 0 4px 0; font-size: 15pt; }
+  .header p { margin: 0; font-size: 9pt; color: #93c5fd; }
+  .callout {
+    background: #f8fafc; border-left: 4px solid #2563eb; border: 1px solid #e2e8f0;
+    border-left-width: 4px; padding: 10px 14px; border-radius: 6px; margin-bottom: 12px;
+  }
+  .callout-title { font-weight: 700; color: #1d4ed8; font-size: 9.5pt; text-transform: uppercase; margin-bottom: 4px; }
+  h2 { font-size: 11.5pt; color: #0f172a; border-bottom: 1.5px solid #cbd5e1; padding-bottom: 4px; margin-top: 14px; margin-bottom: 8px; page-break-after: avoid; }
+  h3 { font-size: 10pt; color: #1e3a8a; margin-top: 10px; margin-bottom: 4px; page-break-after: avoid; }
+  pre, code { font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; }
+  pre {
+    background-color: #0f172a; color: #38bdf8; padding: 6px 10px; border-radius: 4px;
+    font-size: 8.2pt; margin: 5px 0; white-space: pre-wrap; word-break: break-all; line-height: 1.35;
+  }
+  .card { background: #ffffff; border: 1px solid #e2e8f0; border-radius: 6px; padding: 9px 12px; margin-bottom: 8px; page-break-inside: avoid; }
+  table { width: 100%; border-collapse: collapse; margin: 8px 0; font-size: 8.2pt; page-break-inside: avoid; }
+  th { background-color: #1e293b; color: #ffffff; text-align: left; padding: 6px 8px; }
+  td { padding: 5px 8px; border-bottom: 1px solid #e2e8f0; }
+  tr:nth-child(even) td { background-color: #f8fafc; }
+</style>
+</head>
+<body>
+<div class="header">
+  <h1>Kubernetes Production Engineering Playbook</h1>
+  <p>Production Case Study: CNI Network Diagnostics, Node Recovery, Deployment Scaling & Rollouts</p>
+</div>
+
+<div class="callout">
+  <div class="callout-title">⭐ 1-Minute Elevator Pitch</div>
+  <p style="margin:0; font-size:8.8pt;">
+    "In a multi-node Kubernetes cluster, I resolved a critical CNI failure where <code>kubworker-node2</code> was scheduling pods into a persistent <code>ContainerCreating</code> state. Inspecting <code>kubectl describe pod</code> and container logs showed <code>FailedCreatePodSandbox: failed to load flannel subnet.env</code> because the <code>kube-flannel</code> DaemonSet was in <code>CrashLoopBackOff</code> due to missing <code>br_netfilter</code> kernel configurations. I loaded <code>br_netfilter</code>, enabled <code>bridge-nf-call-iptables</code>, <code>bridge-nf-call-ip6tables</code>, and <code>net.ipv4.ip_forward</code>, and persisted them across reboots via <code>/etc/modules-load.d/</code> and <code>/etc/sysctl.d/</code>. Once the pod was recycled, all 5 deployment replicas scheduled cleanly across both worker nodes. I then validated deployment operations by scaling to 15 replicas, executing rolling updates via <code>kubectl set image</code>, and tracking rollout state."
+  </p>
+</div>
+
+<h2>1. Production Incident Case Study: CNI Network Failure & Node Recovery</h2>
+
+<div class="card">
+  <h3>1.1 Problem Statement & Symptoms</h3>
+  <p style="margin:2px 0 6px 0;">A 5-replica Nginx deployment resulted in only 3 pods in <code>Running</code> status on <code>kubworker-node1</code>, while pods scheduled on <code>kubworker-node2</code> remained stuck in <code>ContainerCreating</code> with no IP assigned.</p>
+  <pre>root@Kubmaster-node:~/kubernetes# kubectl get pods -o wide
+NAME                          READY   STATUS              RESTARTS   AGE     IP           NODE
+nginx-deploy-5dcc99ff6-5jgj4   1/1     Running             0          3m12s   10.244.1.6   kubworker-node1
+nginx-deploy-5dcc99ff6-h9clr   0/1     ContainerCreating   0          3m12s   &lt;none&gt;       kubworker-node2
+nginx-deploy-5dcc99ff6-v899g   0/1     ContainerCreating   0          3m12s   &lt;none&gt;       kubworker-node2</pre>
+</div>
+
+<div class="card">
+  <h3>1.2 Root Cause Analysis</h3>
+  <p style="margin:2px 0 4px 0;"><strong>Pod Event Inspection:</strong></p>
+  <pre>kubectl describe pod nginx-deploy-5dcc99ff6-h9clr
+Warning  FailedCreatePodSandbox: failed to load flannel 'subnet.env' file: open /run/flannel/subnet.env: no such file or directory</pre>
+  <p style="margin:6px 0 4px 0;"><strong>CNI DaemonSet Log Diagnostics:</strong></p>
+  <pre>kubectl logs -n kube-flannel kube-flannel-ds-7vhqk --previous
+E0829 02:28:24.412497 1 main.go:292] Failed to check br_netfilter: stat /proc/sys/net/bridge/bridge-nf-call-iptables: no such file or directory</pre>
+</div>
+
+<div class="card">
+  <h3>1.3 Permanent Remediation</h3>
+  <pre># 1. Load module & configure sysctl on worker node
+sudo modprobe br_netfilter
+sudo sysctl -w net.bridge.bridge-nf-call-iptables=1 net.bridge.bridge-nf-call-ip6tables=1 net.ipv4.ip_forward=1
+
+# 2. Persist configurations
+cat &lt;&lt;EOF | sudo tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+
+cat &lt;&lt;EOF | sudo tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+EOF
+sudo sysctl --system
+
+# 3. Recycle Flannel DaemonSet Pod from master
+kubectl delete pod -n kube-flannel kube-flannel-ds-7vhqk</pre>
+</div>
+
+<h2>2. Workload Management & Rollout Operations</h2>
+<div class="card">
+  <pre># Deployment manifest application
+kubectl apply -f nginx-deploy.yaml
+
+# Scaling operations (Scale out to 15, scale in to 1)
+kubectl scale deployment nginx-deploy --replicas=15
+kubectl scale deployment nginx-deploy --replicas=1
+
+# Rolling update & rollout tracking
+kubectl set image deployment/nginx-deploy nginx-container=nginx:stable-otel
+kubectl rollout status deployment/nginx-deploy
+kubectl rollout history deployment/nginx-deploy</pre>
+</div>
+
+<h2>3. Diagnostic Command Matrix</h2>
+<table>
+  <thead>
+    <tr>
+      <th>Layer</th>
+      <th>Diagnostic Command</th>
+      <th>Expected Healthy Output</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>Pod Scheduling</strong></td>
+      <td><code>kubectl get pods -o wide</code></td>
+      <td>Status: <code>Running</code>, Pod IP assigned from node subnet</td>
+    </tr>
+    <tr>
+      <td><strong>CNI Network</strong></td>
+      <td><code>kubectl get pods -n kube-flannel -o wide</code></td>
+      <td>Status: <code>Running (1/1)</code> across all nodes</td>
+    </tr>
+    <tr>
+      <td><strong>Linux Netfilter</strong></td>
+      <td><code>lsmod | grep br_netfilter</code></td>
+      <td><code>br_netfilter</code> module active in kernel</td>
+    </tr>
+    <tr>
+      <td><strong>Packet Forwarding</strong></td>
+      <td><code>sysctl net.ipv4.ip_forward</code></td>
+      <td><code>net.ipv4.ip_forward = 1</code></td>
+    </tr>
+    <tr>
+      <td><strong>API Reachability</strong></td>
+      <td><code>nc -zv &lt;MASTER-IP&gt; 6443</code></td>
+      <td>Connection succeeded (TCP 6443 open)</td>
+    </tr>
+  </tbody>
+</table>
+</body>
+</html>
